@@ -1,12 +1,15 @@
 
-from tinygrad import dtypes
+import numpy as np
+from tinygrad import Tensor, Device, Context, GlobalCounters, dtypes
 from tinygrad.uop.ops import UOp, KernelInfo, AxisType
+from tinygrad.engine.realize import ExecItem, get_runner
 from tinygrad.dtype import AddrSpace
 from tinygrad.helpers import getenv
-from extra.gemm.amd_uop_matmul import copy, rngs_for_shape, test_matmul
+from extra.gemm.amd_uop_matmul import copy, rngs_for_shape
 
 N = getenv("N", 4096)
 M = K = N # square
+run_count = getenv("CNT", 5)
 
 WARP_SIZE = 32
 BLOCK_M = 64    # rows of C per block
@@ -76,7 +79,7 @@ def hand_spec():
   As = UOp.placeholder((BLOCK_K, BLOCK_M), dtypes.half, slot=0, addrspace=AddrSpace.LOCAL)
   Bs = UOp.placeholder((BLOCK_K, BLOCK_N), dtypes.half, slot=1, addrspace=AddrSpace.LOCAL)
 
-  As_store = copy(As.reshape(-1, THREADS_PER_BLOCK)[:, tid],
+  As_store = copy(As.permute((1, 0)).reshape(-1, THREADS_PER_BLOCK)[:, tid],
                   a.reshape(-1, THREADS_PER_BLOCK)[:, tid], rng=100)
   Bs_store = copy(Bs.reshape(-1, THREADS_PER_BLOCK)[:, tid],
                   b.reshape(-1, THREADS_PER_BLOCK)[:, tid], rng=200)
@@ -127,10 +130,38 @@ def hand_spec():
                 WARPS_IN_BLOCK_X, ITERS_PER_WARP_N, LANES_PER_WARP_X, TN)
   c = c[warpIdy, :, laneIdy, :,
         warpIdx, :, laneIdx, :]  # pick this thread's output tile
-  sink = copy(c, c_regs.after(sink).cast(dtypes.half), rng=600)  # write accumulators back to global
+  # NOTE: cast must happen per-element inside the copy, not on the whole buffer
+  iterWarpM2, yt2, iterWarpN2, xt2 = rngs2 = rngs_for_shape(c_regs.shape, 600)
+  sink = c[*rngs2].store(c_regs.after(sink)[*rngs2].cast(dtypes.half)).end(*rngs2)  # write accumulators back to global
 
   return sink.sink(arg=KernelInfo(opts_to_apply=())).simplify()
 
-if __name__ == "__main__":
-  test_matmul(hand_spec(), N=N)
 
+
+def test_matmul_fp16(sink:UOp, N=N):
+  rng = np.random.default_rng()
+  a = Tensor((rng.random((N, N), dtype=np.float32)-0.5).astype(np.float16))
+  b = Tensor((rng.random((N, N), dtype=np.float32)-0.5).astype(np.float16))
+  hc = Tensor.empty(N, N, dtype=dtypes.half)
+  Tensor.realize(a, b, hc)
+
+  ei = ExecItem(get_runner(Device.DEFAULT, sink), [t.uop.buffer for t in [hc, a, b]])
+
+  ets = []
+  with Context(DEBUG=2):
+    for _ in range(run_count):
+      ets.append(ei.run(wait=True))
+  print(f"REAL TFLOPS {N * N * N * 2 / min(ets) * 1e-12:.2f}")
+
+  if getenv("VERIFY", 1):
+    GlobalCounters.reset()
+    with Context(DEBUG=2):
+      tc = (a.cast(dtypes.float) @ b.cast(dtypes.float)).realize()
+    with Context(DEBUG=0):
+      err = (hc.cast(dtypes.float) - tc).square().mean().item()
+    print(f"mean squared error {err}")
+    if err > 1e-02:
+      raise RuntimeError("matmul is wrong!")
+
+if __name__ == "__main__":
+  test_matmul_fp16(hand_spec(), N=N)
