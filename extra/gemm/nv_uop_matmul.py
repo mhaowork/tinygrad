@@ -146,11 +146,14 @@ def hand_spec():
   # REG -> GLOBAL (epilogue)
   # ---------------------------
   n_idx = UOp.range(WARP_TILE_N // TC_N, 600)
-  elem = UOp.range(4, 601, AxisType.UPCAST)
-  out_row = warpIdy * TC_M + (lane // 4) + (elem // 2) * 8
-  out_col = n_idx * TC_N + (elem % 2) + (lane % 4) * 2
-  c_tile = c.reshape(BLOCK_M, BLOCK_N)[out_row, out_col]
-  sink = c_tile.store(c_regs.after(sink)[n_idx].gep(elem).cast(dtypes.half)).end(n_idx, elem)
+  c_tile = c.reshape(BLOCK_M, BLOCK_N)
+  acc = c_regs.after(sink)[n_idx]
+  stores = []
+  for elem in range(4):
+    out_row = warpIdy * TC_M + (lane // 4) + (elem // 2) * 8
+    out_col = n_idx * TC_N + (elem % 2) + (lane % 4) * 2
+    stores.append(c_tile[out_row, out_col].store(acc.gep(elem).cast(dtypes.half)))
+  sink = UOp.group(*stores).end(n_idx)
 
   return sink.sink(arg=KernelInfo(opts_to_apply=())).simplify()
 
