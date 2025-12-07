@@ -49,7 +49,7 @@ WARPS_IN_BLOCK_Y = BLOCK_M // WARP_TILE_M
 assert WARPS_IN_BLOCK_X * WARPS_IN_BLOCK_Y == WARPS_PER_BLOCK
 
 # How many 16x8 tiles per warp
-M_TILES = WARP_TILE_M // TC_M  # 64 / 16 = 4
+M_TILES = WARP_TILE_M // TC_M  # 32 / 16 = 2
 N_TILES = WARP_TILE_N // TC_N  # 64 / 8 = 8
 
 
@@ -109,6 +109,14 @@ def hand_spec_nv_wmma():
 
     lane = tid % WARP_SIZE
 
+    # Decompose lane ID into bits (matching generated code pattern)
+    # This is the key to proper WMMA fragment mapping
+    l0 = lane & 1           # Bit 0
+    l1 = (lane >> 1) & 1    # Bit 1
+    l2 = (lane >> 2) & 1    # Bit 2
+    l3 = (lane >> 3) & 1    # Bit 3
+    l4 = lane >> 4          # Bits 4+ (0 or 1 for warp of 32)
+
     # ---------------------------
     # Reshape for WMMA access
     # ---------------------------
@@ -122,11 +130,12 @@ def hand_spec_nv_wmma():
     # Initialize accumulators
     # ---------------------------
     # Each warp computes M_TILES x N_TILES tiles
-    # Each tile accumulator is vec(4) of fp32
-    c_regs = UOp.placeholder((M_TILES, N_TILES), dtypes.float.vec(4), slot=2, addrspace=AddrSpace.REG)
+    # Each tile accumulator has 4 fp32 values
+    # Store as individual floats, not vec(4), for easier indexing
+    c_regs = UOp.placeholder((M_TILES, N_TILES, 4), dtypes.float, slot=2, addrspace=AddrSpace.REG)
 
     init_i = UOp.range(c_regs.size, 16)
-    c_regs = c_regs.after(c_regs.flatten()[init_i].store(UOp.const(dtypes.float.vec(4), 0.0)).end(init_i))
+    c_regs = c_regs.after(c_regs.flatten()[init_i].store(UOp.const(dtypes.float, 0.0)).end(init_i))
 
     # ---------------------------
     # Inner K loop (iterate over TC_K chunks)
@@ -136,37 +145,51 @@ def hand_spec_nv_wmma():
     # ---------------------------
     # Load fragments and do WMMA
     # ---------------------------
-    # For simplicity, we'll use a basic indexing scheme
-    # In production, you'd want the exact swizzle pattern from generated code
+    # CORRECT fragment loading based on m16n8k16 WMMA layout
+    # References:
+    # - NVIDIA WMMA docs: each thread holds 8 elements for A (m16xk16)
+    # - tc.py:78-81: swizzle patterns for WMMA_8_16_16_half_float
+    # - uop_graph_wmma_generated.txt: actual bit patterns from TC optimizer
 
     wmma_stores = []
 
     # Iterate over all M_TILES x N_TILES
     for m_tile in range(M_TILES):
-        # Load A fragment for this M tile
-        # Fragment A: 8 half elements per thread, represents 16x16 tile
-        # Simple indexing: each warp gets a vertical slice
+        # Load A fragment for this M tile (m16xk16)
+        # Each thread gets 8 fp16 values from a 16x16 tile
+        # Layout: threads are mapped to rows using l2,l3,l4 and columns using l0,l1
         a_tile_idx = warpIdy * M_TILES + m_tile
 
-        # Create fragment by loading 8 elements
-        # For now, use simplified indexing - in production use generated pattern
         a_frag_elems = []
         for elem in range(8):
-            # Each element comes from As_tc[k_chunk, :, a_tile_idx, :]
-            # Simplified: just reshape and index by lane
-            a_elem = As_tc[k_chunk, elem % TC_K, a_tile_idx, (lane * 8 + elem) % TC_M]
+            # For m16xk16:
+            # - Row index within tile: base determined by l4,l3,l2 + offset by elem
+            # - Col index within tile: determined by l1,l0 + offset by elem
+            # Pattern from tc.py swizzle: 8 elements arranged in 2x4 pattern per thread
+            row_base = (l4 * 8 + l3 * 4 + l2 * 2)  # 16 rows / 32 threads = groups
+            col_idx = (elem // 4) * 8 + l1 * 4 + l0 * 2 + (elem % 4) // 2
+            row_idx = row_base + (elem % 2)
+
+            a_elem = As_tc[k_chunk, col_idx, a_tile_idx, row_idx]
             a_frag_elems.append(a_elem)
 
         a_frag = UOp.vectorize(*a_frag_elems)
 
         for n_tile in range(N_TILES):
-            # Load B fragment for this N tile
-            # Fragment B: 4 half elements per thread
+            # Load B fragment for this N tile (k16xn8)
+            # Each thread gets 4 fp16 values from a 16x8 tile
             b_tile_idx = warpIdx * N_TILES + n_tile
 
             b_frag_elems = []
             for elem in range(4):
-                b_elem = Bs_tc[k_chunk, elem % TC_K, b_tile_idx, (lane * 4 + elem) % TC_N]
+                # For k16xn8:
+                # - Row index (K): determined by elem and lane bits
+                # - Col index (N): determined by l4,l3,l2
+                # Pattern: 4 elements per thread across K and N dimensions
+                row_idx = elem * 4 + l1 * 2 + l0
+                col_idx = l4 * 4 + l3 * 2 + l2
+
+                b_elem = Bs_tc[k_chunk, row_idx, b_tile_idx, col_idx]
                 b_frag_elems.append(b_elem)
 
             b_frag = UOp.vectorize(*b_frag_elems)
@@ -176,36 +199,49 @@ def hand_spec_nv_wmma():
             wmma_arg = ('WMMA_8_16_16_half_float', (8, 16, 16), dtypes.half, dtypes.float, 'CUDA', WARP_SIZE,
                         (((0, 2), (1, 2), (2, 2)), ((0, 2), (1, 2)), ((0, 2), (1, 2))), ())
 
-            acc_in = c_regs.after(a_frag).after(b_frag)[m_tile, n_tile]
+            # Vectorize the 4 accumulator values for WMMA input
+            acc_in = UOp.vectorize(*[c_regs.after(a_frag).after(b_frag)[m_tile, n_tile, i] for i in range(4)])
             wmma_out = UOp(Ops.WMMA, dtypes.float.vec(4), (a_frag, b_frag, acc_in), arg=wmma_arg)
 
-            wmma_stores.append(c_regs[m_tile, n_tile].store(wmma_out))
+            # Unpack the vec(4) result and store 4 individual floats
+            for i in range(4):
+                wmma_stores.append(c_regs[m_tile, n_tile, i].store(wmma_out.gep(i)))
 
     sink = UOp.group(*wmma_stores).end(k_chunk).barrier().end(k_tile_range)
 
     # ---------------------------
     # Epilogue: REG -> GLOBAL
     # ---------------------------
-    # Reshape output to match warp tiling
-    c_shaped = c.reshape(WARPS_IN_BLOCK_Y, M_TILES, TC_M,
-                         WARPS_IN_BLOCK_X, N_TILES, TC_N)
+    # CORRECT output mapping for m16n8k16 C fragment
+    # Each thread has 4 fp32 values mapping to specific positions in 16x8 tile
+    # Layout matches tc.py swizzle for output fragment
 
-    # Each thread writes its 4 accumulator values
-    # Simplified output - each vec(4) maps to specific positions
     output_stores = []
 
     for m_tile in range(M_TILES):
         for n_tile in range(N_TILES):
-            # Each vec(4) contains results for 4 output positions
-            # Simplified mapping: just write based on lane ID
-            for elem in range(4):
-                # Map element to output position (simplified)
-                m_offset = (elem // 2) * 8 + (lane // 4)
-                n_offset = (elem % 2) + (lane % 4) * 2
+            # Calculate base position for this warp's tile in the output
+            base_m = warpIdy * WARP_TILE_M + m_tile * TC_M
+            base_n = warpIdx * WARP_TILE_N + n_tile * TC_N
 
-                out_uop = c_shaped[warpIdy, m_tile, m_offset, warpIdx, n_tile, n_offset]
-                val = c_regs.after(sink)[m_tile, n_tile].gep(elem)
-                output_stores.append(out_uop.store(val))
+            # For m16n8k16 output (16 rows x 8 cols, 4 elements per thread):
+            # Each thread's 4 elements map to specific (row, col) positions
+            # Pattern derived from WMMA C fragment layout
+            for elem in range(4):
+                # Row mapping: uses l4,l3,l2 for base row + elem for sub-row
+                # 32 threads map to 16 rows: each pair of threads shares rows
+                row_idx = (l4 * 8 + l3 * 4 + l2 * 2) + (elem // 2)
+
+                # Col mapping: uses l1,l0 for base col + elem for sub-col
+                # 8 columns distributed across 32 threads
+                col_idx = l1 * 4 + l0 * 2 + (elem % 2)
+
+                out_row = base_m + row_idx
+                out_col = base_n + col_idx
+
+                # Get the accumulated value
+                val = c_regs.after(sink)[m_tile, n_tile, elem]
+                output_stores.append(c.reshape(BLOCK_M, BLOCK_N)[out_row, out_col].store(val))
 
     final_sink = UOp.group(*output_stores)
 
