@@ -227,9 +227,10 @@ def no_vectorized_wmma(wmma:UOp):
   wmma_ex = flatten([[e.gep(i) for i in range(out_sz)] for e in wmmas])
   return UOp(Ops.VECTORIZE, wmma.dtype, tuple(wmma_ex))
 
-def no_vectorized_alu(alu:UOp):
+def no_vectorized_alu(alu:UOp, ctx=None):
   if alu.dtype.vcount == 1: return None
   if alu.op is Ops.WHERE and alu.src[2].arg is Invalid: return None  # image load/store has cond.where(idx.vec(2), Invalid) as the index
+  if getattr(ctx, "device", None) == "CPU" and dtypes.is_float(alu.dtype) and alu.op is Ops.ADD: return None
   alus = tuple(UOp(alu.op, alu.dtype.scalar(), tuple(s.gep(i) for s in alu.src), alu.arg) for i in range(alu.dtype.vcount))
   return UOp(Ops.VECTORIZE, alu.dtype, alus)
 
@@ -310,18 +311,32 @@ def horizontal_reduce(inp:UOp, out_dtype:DType) -> list[UOp]:
 
 def reduce_to_acc(ctx:ReduceContext, red:UOp):
   inp, reduce_range = red.src[0], red.src[1:]
-  lst = horizontal_reduce(inp, red.dtype)
-  assert all(x.dtype == red.dtype for x in lst), f"horizontal reduction mismatch {lst[0].dtype} != {red.dtype}"
+  # this fix should work for other associative Ops but let's start with ADD for now
+  vector_acc = len(reduce_range) != 0 and red.arg is Ops.ADD and red.dtype.count == 1 and inp.dtype.count > 1
+  if vector_acc:
+    acc_dtype = red.dtype.vec(inp.dtype.count)
+    if inp.dtype != acc_dtype: inp = inp.cast(acc_dtype)
+  lst = horizontal_reduce(inp, red.dtype) if not vector_acc else []
+  if lst: assert all(x.dtype == red.dtype for x in lst), f"horizontal reduction mismatch {lst[0].dtype} != {red.dtype}"
   # if we have a range
   if len(reduce_range) != 0:
     topo = inp.toposort()
     ended_ranges = flatten([x.ended_ranges for x in topo if x.op is Ops.END])
     input_ranges = tuple([x for x in topo if x.op is Ops.RANGE and x not in reduce_range and x not in ended_ranges])
-    identity = red.const(red.dtype, identity_element(red.arg, red.dtype.scalar()))
-    acc = UOp(Ops.DEFINE_REG, red.dtype.ptr(size=1, addrspace=AddrSpace.REG), arg=ctx.acc_num)
+    identity_dtype = acc_dtype if vector_acc else red.dtype
+    identity = red.const(identity_dtype, identity_element(red.arg, identity_dtype.scalar()))
+    acc = UOp(Ops.DEFINE_REG, identity_dtype.ptr(size=1, addrspace=AddrSpace.REG), arg=ctx.acc_num)
     acc_init = acc.after(*input_ranges).index(UOp.const(dtypes.int, 0)).store(identity) if len(input_ranges) else \
                acc.index(UOp.const(dtypes.int, 0)).store(identity)
-    lst = [acc.after(acc_init, *reduce_range).index(UOp.const(dtypes.int, 0))] + lst  # put acc as the first element
+    acc_load = acc.after(acc_init, *reduce_range).index(UOp.const(dtypes.int, 0))
+    if vector_acc:
+      ret = acc_load.alu(red.arg, inp)
+      ctx.acc_num += 1
+      acc_after = acc.after(acc.index(UOp.const(dtypes.int, 0)).store(ret).end(*reduce_range)).index(UOp.const(dtypes.int, 0))
+      lst = horizontal_reduce(acc_after, red.dtype)
+      assert all(x.dtype == red.dtype for x in lst), f"horizontal reduction mismatch {lst[0].dtype} != {red.dtype}"
+      return functools.reduce(lambda x,y: x.alu(red.arg, y), lst)
+    lst = [acc_load] + lst # put acc as the first element
     ctx.acc_num += 1
   ret = functools.reduce(lambda x,y: x.alu(red.arg, y), lst)
   if len(reduce_range) == 0: return ret
@@ -344,4 +359,3 @@ pm_add_loads = PatternMatcher([
   # remove loads from stores
   (UPat(Ops.STORE, src=(UPat(Ops.LOAD),), allow_any_len=True, name="s"), lambda s: s.replace(src=(s.src[0].src[0],)+s.src[1:])),
 ])
-
