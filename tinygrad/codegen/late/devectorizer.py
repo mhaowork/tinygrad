@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from tinygrad.dtype import dtypes, ImageDType, DType, AddrSpace, Invalid, PtrDType
 from tinygrad.uop.ops import UOp, Ops, UPat, PatternMatcher, GroupOp, identity_element
 from tinygrad.uop.symbolic import uop_given_valid, parse_valid, invalid_gate
-from tinygrad.helpers import getenv, flatten, AMX, prod
+from tinygrad.helpers import getenv, flatten, AMX, prod, DEBUG
 from tinygrad.renderer import Renderer
 
 # ***** image load valid simplification *****
@@ -234,7 +234,11 @@ def no_vectorized_alu(alu:UOp, ctx=None):
   alus = tuple(UOp(alu.op, alu.dtype.scalar(), tuple(s.gep(i) for s in alu.src), alu.arg) for i in range(alu.dtype.vcount))
   return UOp(Ops.VECTORIZE, alu.dtype, alus)
 
-def no_vectorized_buf(buf:UOp):
+def no_vectorized_buf(buf:UOp, ctx=None):
+  # On CPU, keep vector register accumulators vectorized. This allows reduce vector_acc to survive devectorize and generate SIMD ALU.
+  if (getattr(ctx, "device", None) == "CPU" and buf.op is Ops.DEFINE_REG and buf.ptrdtype.addrspace == AddrSpace.REG and
+      buf.ptrdtype.base.count > 1 and dtypes.is_float(buf.ptrdtype.base.scalar())):
+    return None
   return buf.replace(dtype=buf.ptrdtype.base.scalar().ptr(buf.ptrdtype.size*buf.ptrdtype.count, buf.ptrdtype.addrspace)).cast(buf.dtype)
 
 def no_vectorized_index(buf:UOp, cast:UOp, idx:UOp):
@@ -300,6 +304,7 @@ pm_render = PatternMatcher([
 @dataclass
 class ReduceContext:
   acc_num: int = 0
+  device: str|None = None
 
 def horizontal_reduce(inp:UOp, out_dtype:DType) -> list[UOp]:
   # if this has a horizontal reduction component, do that first
@@ -309,12 +314,50 @@ def horizontal_reduce(inp:UOp, out_dtype:DType) -> list[UOp]:
     return [inp.gep(tuple(range(i, inp.dtype.count, horizontal_amount))) for i in range(0, horizontal_amount)]
   return [inp]
 
+def split_vector_for_multi_acc(inp:UOp, out_dtype:DType) -> list[UOp] | None:
+  if inp.dtype.count % out_dtype.count != 0: return None
+  split = inp.dtype.count // out_dtype.count
+  if inp.op is Ops.INDEX and inp.src and inp.src[0].op is Ops.VECTORIZE and inp.src[1].dtype.count == inp.dtype.count:
+    ptrs = inp.src[0].src
+    if len(ptrs) == inp.dtype.count and len(set(ptrs)) == 1:
+      base_ptr = ptrs[0]
+      idx_vec = inp.src[1]
+      parts = []
+      for i in range(split):
+        start = i * out_dtype.count
+        end = start + out_dtype.count
+        if end > inp.dtype.count: return None
+        lane_loads = [UOp(Ops.INDEX, out_dtype.scalar(), src=(base_ptr, idx_vec.gep(j))) for j in range(start, end)]
+        parts.append(lane_loads[0] if out_dtype.count == 1 else UOp(Ops.VECTORIZE, out_dtype, tuple(lane_loads)))
+      return parts
+  if inp.op in (Ops.VECTORIZE, Ops.CAT) and len(inp.src) == split and all(s.dtype == out_dtype for s in inp.src):
+    return list(inp.src)
+  if inp.op is Ops.VECTORIZE and len(inp.src) == inp.dtype.count and all(s.op is Ops.GEP for s in inp.src):
+    parts = []
+    step = out_dtype.count if out_dtype.count > 1 else None
+    i = 0
+    while i < len(inp.src):
+      base = inp.src[i].src[0]
+      if step is None: step = base.dtype.count
+      chunk = inp.src[i:i+step]
+      if base.dtype.count != step or base.dtype.scalar() != out_dtype.scalar(): return None
+      if base.dtype.count == 1 or any(c.src[0] is not base for c in chunk): return None
+      if tuple(c.arg[0] for c in chunk) != tuple(range(step)): return None
+      parts.append(base)
+      i += step
+    if len(parts) == split: return parts
+  return None
+
 def reduce_to_acc(ctx:ReduceContext, red:UOp):
   inp, reduce_range = red.src[0], red.src[1:]
   # this fix should work for other associative Ops but let's start with ADD for now
-  vector_acc = len(reduce_range) != 0 and red.arg is Ops.ADD and red.dtype.count == 1 and inp.dtype.count > 1
+  # On CPU, allow vectorized outputs for UPCAST kernels to keep vector operations throughout
+  vector_acc = (len(reduce_range) != 0 and red.arg is Ops.ADD and inp.dtype.count > 1 and
+                (red.dtype.count == 1 or (ctx.device == "CPU" and red.dtype.count > 1)))
   if vector_acc:
-    acc_dtype = red.dtype.vec(inp.dtype.count)
+    # For UPCAST kernels with vectorized output, use inp.dtype directly as accumulator
+    # For scalar output, create vector accumulator from scalar
+    acc_dtype = inp.dtype if red.dtype.count > 1 else red.dtype.vec(inp.dtype.count)
     if inp.dtype != acc_dtype: inp = inp.cast(acc_dtype)
   lst = horizontal_reduce(inp, red.dtype) if not vector_acc else []
   if lst: assert all(x.dtype == red.dtype for x in lst), f"horizontal reduction mismatch {lst[0].dtype} != {red.dtype}"
@@ -325,17 +368,52 @@ def reduce_to_acc(ctx:ReduceContext, red:UOp):
     input_ranges = tuple([x for x in topo if x.op is Ops.RANGE and x not in reduce_range and x not in ended_ranges])
     identity_dtype = acc_dtype if vector_acc else red.dtype
     identity = red.const(identity_dtype, identity_element(red.arg, identity_dtype.scalar()))
-    acc = UOp(Ops.DEFINE_REG, identity_dtype.ptr(size=1, addrspace=AddrSpace.REG), arg=ctx.acc_num)
-    acc_init = acc.after(*input_ranges).index(UOp.const(dtypes.int, 0)).store(identity) if len(input_ranges) else \
-               acc.index(UOp.const(dtypes.int, 0)).store(identity)
-    acc_load = acc.after(acc_init, *reduce_range).index(UOp.const(dtypes.int, 0))
     if vector_acc:
+      # For UPCAST reductions, keep per-lane vector accumulators if the input is already grouped into output-sized vectors.
+      multi_acc_parts = None
+      if ctx.device == "CPU" and inp.dtype.count > red.dtype.count:
+        part_dtype = red.dtype
+        if red.dtype.count == 1:
+          part_count = 1
+          if inp.dtype.count % 4 == 0: part_count = 4
+          elif inp.dtype.count % 2 == 0: part_count = 2
+          part_dtype = red.dtype.vec(part_count)
+        multi_acc_parts = split_vector_for_multi_acc(inp, part_dtype)
+      if multi_acc_parts:
+        acc_stores = []
+        acc_defs = []
+        for part in multi_acc_parts:
+          identity = red.const(part.dtype, identity_element(red.arg, part.dtype.scalar()))
+          acc = UOp(Ops.DEFINE_REG, part.dtype.ptr(size=1, addrspace=AddrSpace.REG), arg=ctx.acc_num)
+          acc_init = acc.after(*input_ranges).index(UOp.const(dtypes.int, 0)).store(identity) if len(input_ranges) else \
+                     acc.index(UOp.const(dtypes.int, 0)).store(identity)
+          acc_load = acc.after(acc_init, *reduce_range).index(UOp.const(dtypes.int, 0))
+          ret = acc_load.alu(red.arg, part)
+          ctx.acc_num += 1
+          acc_stores.append(acc.index(UOp.const(dtypes.int, 0)).store(ret))
+          acc_defs.append(acc)
+        end_marker = UOp.sink(*acc_stores).end(*reduce_range)
+        acc_parts = [acc.after(end_marker).index(UOp.const(dtypes.int, 0)) for acc in acc_defs]
+        combined = functools.reduce(lambda x,y: x.alu(red.arg, y), acc_parts)
+        if red.dtype.count == 1:
+          lst = horizontal_reduce(combined, red.dtype)
+          assert all(x.dtype == red.dtype for x in lst), f"horizontal reduction mismatch {lst[0].dtype} != {red.dtype}"
+          return functools.reduce(lambda x,y: x.alu(red.arg, y), lst)
+        return combined
+      acc = UOp(Ops.DEFINE_REG, identity_dtype.ptr(size=1, addrspace=AddrSpace.REG), arg=ctx.acc_num)
+      acc_init = acc.after(*input_ranges).index(UOp.const(dtypes.int, 0)).store(identity) if len(input_ranges) else \
+                 acc.index(UOp.const(dtypes.int, 0)).store(identity)
+      acc_load = acc.after(acc_init, *reduce_range).index(UOp.const(dtypes.int, 0))
       ret = acc_load.alu(red.arg, inp)
       ctx.acc_num += 1
       acc_after = acc.after(acc.index(UOp.const(dtypes.int, 0)).store(ret).end(*reduce_range)).index(UOp.const(dtypes.int, 0))
       lst = horizontal_reduce(acc_after, red.dtype)
       assert all(x.dtype == red.dtype for x in lst), f"horizontal reduction mismatch {lst[0].dtype} != {red.dtype}"
       return functools.reduce(lambda x,y: x.alu(red.arg, y), lst)
+    acc = UOp(Ops.DEFINE_REG, identity_dtype.ptr(size=1, addrspace=AddrSpace.REG), arg=ctx.acc_num)
+    acc_init = acc.after(*input_ranges).index(UOp.const(dtypes.int, 0)).store(identity) if len(input_ranges) else \
+               acc.index(UOp.const(dtypes.int, 0)).store(identity)
+    acc_load = acc.after(acc_init, *reduce_range).index(UOp.const(dtypes.int, 0))
     lst = [acc_load] + lst # put acc as the first element
     ctx.acc_num += 1
   ret = functools.reduce(lambda x,y: x.alu(red.arg, y), lst)
