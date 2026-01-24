@@ -22,8 +22,13 @@ class MixtureFeedForward:
     probs, sel = g.topk(self.activated_experts)
 
     # run MoE
-    x_up_gate = x.dot(self.gate_proj[sel].permute(0,2,1)).silu() * x.dot(self.up_proj[sel].permute(0,2,1))
-    x_down = x_up_gate.dot(self.down_proj[sel].permute(0,2,1))
+    selected_gate_projs = self.gate_proj[sel]
+    selected_up_projs = self.up_proj[sel]
+    selected_down_projs = self.down_proj[sel]
+    # Split indexing from dot so dot kernels keep their own optimizations.
+    selected_gate_projs.realize(selected_up_projs, selected_down_projs)
+    x_up_gate = x.dot(selected_gate_projs.permute(0,2,1)).silu() * x.dot(selected_up_projs.permute(0,2,1))
+    x_down = x_up_gate.dot(selected_down_projs.permute(0,2,1))
     return (x_down * probs.reshape(self.activated_experts, 1, 1)).sum(axis=0)
 
 # model is bf16, 1.3B active, 6.9B total
