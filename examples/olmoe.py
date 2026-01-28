@@ -16,7 +16,9 @@ class MixtureFeedForward:
   def __call__(self, x:Tensor) -> Tensor:
     assert x.shape[0] == 1, "only BS=1"
     assert x.shape[1] == 1, "only length=1"
-    g = self.gate(x).softmax(-1)
+    gate_logits = self.gate(x)
+    gate_logits.realize()
+    g = gate_logits.softmax(-1)
 
     g = g.squeeze() # (BS, length, num_experts) -> (num_experts,)
     probs, sel = g.topk(self.activated_experts)
@@ -27,8 +29,11 @@ class MixtureFeedForward:
     selected_down_projs = self.down_proj[sel]
     # Split indexing from dot so dot kernels keep their own optimizations.
     selected_gate_projs.realize(selected_up_projs, selected_down_projs)
-    x_up_gate = x.dot(selected_gate_projs.permute(0,2,1)).silu() * x.dot(selected_up_projs.permute(0,2,1))
-    x_down = x_up_gate.dot(selected_down_projs.permute(0,2,1))
+    gate_act = x.dot(selected_gate_projs.permute(0,2,1)).silu()
+    up_act = x.dot(selected_up_projs.permute(0,2,1))
+    gate_act.realize(up_act)
+    x_up_gate = gate_act * up_act
+    x_down = x_up_gate.dot(selected_down_projs.permute(0,2,1)).realize()
     return (x_down * probs.reshape(self.activated_experts, 1, 1)).sum(axis=0)
 
 # model is bf16, 1.3B active, 6.9B total
@@ -95,4 +100,3 @@ if __name__ == "__main__":
     # Hello, I am a newbie to this forum and I am trying to get a better understanding of the different types of data that can be stored in a
     assert toks == [12092, 13, 309, 717, 247, 747, 17782, 281, 436, 12209, 285, 309, 717, 2820, 281, 755,
                     247, 1805, 4685, 273, 253, 1027, 3510, 273, 941, 326, 476, 320, 7141, 275, 247], "BAD OUTPUT!"
-
